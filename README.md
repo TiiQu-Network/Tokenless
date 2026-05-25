@@ -17,10 +17,10 @@ For `gpt-oss:20b`, the model is downloaded once during `llm.start()`. Repeated
 
 ## Quick Start
 
-Install from PyPI:
-
+Install:
+download the repo and use the following command
 ```bash
-pip install tokenless
+pip install -e .
 ```
 ## Kaggle Credentials
 

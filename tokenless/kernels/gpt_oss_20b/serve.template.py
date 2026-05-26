@@ -23,6 +23,8 @@ OUT = Path("/kaggle/working/tokenless_public_url.txt")
 ERR = Path("/kaggle/working/tokenless_server_error.txt")
 CLOUDFLARED_LOG = Path("/tmp/tokenless_cloudflared.log")
 PDF_MARKDOWN = Path("/kaggle/working/tokenless_pdf_context.md")
+PAGE_MAP_MIN_PROMPT_CHARS = 4000
+PAGE_MAP_REQUEST_TIMEOUT = 900
 
 
 def _fail(msg: str) -> None:
@@ -237,6 +239,8 @@ def _inject_pdf_context(payload: dict) -> dict:
         return payload
     markdown = PDF_MARKDOWN.read_text(encoding="utf-8")
     messages = list(payload.get("messages") or [])
+    if any("<tokenless_pdf_page_context>" in str(message.get("content") or "") for message in messages):
+        return payload
     question = ""
     for message in reversed(messages):
         if message.get("role") == "user":
@@ -255,6 +259,102 @@ def _inject_pdf_context(payload: dict) -> dict:
     else:
         messages.insert(0, {"role": "system", "content": context})
     return {**payload, "messages": messages}
+
+
+def _last_user_message(payload: dict) -> str:
+    for message in reversed(payload.get("messages") or []):
+        if message.get("role") == "user":
+            return str(message.get("content") or "")
+    return ""
+
+
+def _should_map_pdf_pages(payload: dict) -> bool:
+    return False
+
+
+def _split_pdf_pages(markdown: str) -> list[tuple[int, str]]:
+    pages = []
+    for chunk in re.split(r"(?=<!-- tokenless-page: page=\d+ -->)", markdown):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        match = re.match(r"<!-- tokenless-page: page=(\d+) -->", chunk)
+        page_number = int(match.group(1)) if match else len(pages) + 1
+        pages.append((page_number, chunk))
+    return pages
+
+
+def _payload_for_pdf_page(payload: dict, page_number: int, page_markdown: str, total_pages: int) -> dict:
+    messages = list(payload.get("messages") or [])
+    context = (
+        "You are processing one page from an uploaded PDF. Apply the user's prompt "
+        "only to this page. If the prompt asks for extraction or analysis, return "
+        "only findings supported by this page. If this page has no relevant answer, "
+        "return an empty response.\n\n"
+        f"PDF page {page_number} of {total_pages}:\n\n"
+        f"<pdf_markdown>\n{page_markdown}\n</pdf_markdown>"
+    )
+    if messages and messages[0].get("role") == "system":
+        messages[0] = {**messages[0], "content": f"{messages[0].get('content', '')}\n\n{context}"}
+    else:
+        messages.insert(0, {"role": "system", "content": context})
+    return {**payload, "messages": messages, "stream": False}
+
+
+def _post_ollama_chat(payload: dict, timeout: int = PAGE_MAP_REQUEST_TIMEOUT) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "http://localhost:11434/v1/chat/completions",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _assistant_content(response_payload: dict) -> str:
+    choices = response_payload.get("choices") or []
+    if not choices:
+        return ""
+    message = choices[0].get("message") or {}
+    return str(message.get("content") or "").strip()
+
+
+def _map_pdf_pages(payload: dict) -> dict:
+    markdown = PDF_MARKDOWN.read_text(encoding="utf-8")
+    pages = _split_pdf_pages(markdown)
+    outputs = []
+    last_response = {
+        "id": "chatcmpl-tokenless-page-map",
+        "object": "chat.completion",
+        "model": payload.get("model", OLLAMA_MODEL),
+        "choices": [],
+    }
+    for index, (page_number, page_markdown) in enumerate(pages, start=1):
+        print(f"Running page-mapped prompt on PDF page {page_number} ({index}/{len(pages)})...", flush=True)
+        page_payload = _payload_for_pdf_page(payload, page_number, page_markdown, len(pages))
+        last_response = _post_ollama_chat(page_payload)
+        content = _assistant_content(last_response)
+        if content:
+            outputs.append(f"## Page {page_number}\n\n{content}")
+
+    merged_content = "\n\n---\n\n".join(outputs).strip()
+    if not merged_content:
+        merged_content = "No relevant content was found in the PDF pages."
+    return {
+        **last_response,
+        "id": "chatcmpl-tokenless-page-map",
+        "object": "chat.completion",
+        "model": last_response.get("model", payload.get("model", OLLAMA_MODEL)),
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": merged_content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
 
 
 def _tokenize(text: str) -> set[str]:
@@ -305,6 +405,18 @@ class TokenlessProxy(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
+        if self.path.rstrip("/") == "/tokenless/pdf/pages":
+            if not PDF_MARKDOWN.exists():
+                self._send_json(404, {"error": "PDF Markdown context is not available."})
+                return
+            pages = [
+                {"page": page_number, "markdown": page_markdown}
+                for page_number, page_markdown in _split_pdf_pages(
+                    PDF_MARKDOWN.read_text(encoding="utf-8")
+                )
+            ]
+            self._send_json(200, {"pages": pages})
+            return
         target = f"http://localhost:11434{self.path}"
         try:
             with urllib.request.urlopen(target, timeout=30) as response:
@@ -326,6 +438,9 @@ class TokenlessProxy(BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             payload = json.loads(body.decode("utf-8"))
             if self.path.rstrip("/") == "/v1/chat/completions":
+                if _should_map_pdf_pages(payload):
+                    self._send_json(200, _map_pdf_pages(payload))
+                    return
                 payload = _inject_pdf_context(payload)
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(

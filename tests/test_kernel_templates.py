@@ -40,3 +40,20 @@ def test_gpt_oss_kernel_templates_find_nested_kaggle_dataset_mounts():
         assert 'input_root.glob(f"**/{dataset_slug}")' in body
         assert "expected_paths" in body
         assert "Uploaded PDF was not found at any of" in body
+
+
+def test_gpt_oss_server_template_maps_large_pdf_prompts_by_page():
+    root = Path(__file__).resolve().parents[1]
+    body = (
+        root
+        / "tokenless"
+        / "kernels"
+        / "gpt_oss_20b"
+        / "serve.template.py"
+    ).read_text(encoding="utf-8")
+
+    assert "PAGE_MAP_MIN_PROMPT_CHARS" in body
+    assert "def _split_pdf_pages" in body
+    assert "def _map_pdf_pages" in body
+    assert "Running page-mapped prompt on PDF page" in body
+    assert "## Page {page_number}" in body

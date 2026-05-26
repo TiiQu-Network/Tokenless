@@ -162,3 +162,36 @@ def test_start_waits_for_public_endpoint_readiness(monkeypatch):
     assert result == "https://ready.trycloudflare.com"
     assert llm.base_url == "https://ready.trycloudflare.com"
     assert requests == [("https://ready.trycloudflare.com/api/version", 10)]
+
+
+def test_chat_uses_long_timeout_for_pdf_page_mapping():
+    llm = make_llm()
+    calls = []
+
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+
+            class Message:
+                content = "ok"
+
+            class Choice:
+                message = Message()
+
+            class Response:
+                choices = [Choice()]
+
+            return Response()
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        chat = Chat()
+
+    llm._running = True
+    llm._base_url = "https://ready.trycloudflare.com"
+    llm._openai_client = Client()
+
+    assert llm.chat("hello") == "ok"
+    assert calls[0]["timeout"] == 3600

@@ -23,6 +23,7 @@ from tokenless.notebook import (
 from tokenless.tunnel import TunnelManager
 
 logger = logging.getLogger(__name__)
+PDF_PAGE_MAP_MIN_PROMPT_CHARS = 4000
 
 SUPPORTED_MODELS = [
     "llama3.1-8b",
@@ -152,6 +153,7 @@ class TokenlessLLM:
         self._openai_client: Optional[openai.OpenAI] = None
         self._running = False
         self._batch_pdf_file_path: Optional[str] = None
+        self._pdf_context = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -237,6 +239,7 @@ class TokenlessLLM:
     ) -> str:
         if public_url and file_path:
             raise ValueError("file_path PDF conversion runs on Kaggle and cannot use public_url.")
+        self._pdf_context = False
         if public_url:
             if progress_callback:
                 progress_callback("Connecting to existing endpoint")
@@ -244,6 +247,7 @@ class TokenlessLLM:
             self._openai_client = openai.OpenAI(
                 base_url=f"{self._base_url}/v1",
                 api_key="kaggle-free",
+                timeout=3600,
             )
             self._running = True
             logger.info("Connected to existing endpoint: %s", self._base_url)
@@ -263,6 +267,7 @@ class TokenlessLLM:
             gpt_oss_accelerator=gpt_oss_accelerator,
             progress_callback=progress_callback,
         )
+        self._pdf_context = pdf_context
 
         if self._notebook.public_url:
             logger.info("Waiting for tunnel URL (timeout=%ds)...", timeout)
@@ -300,6 +305,7 @@ class TokenlessLLM:
             self._notebook.stop()
             self._tunnel.close()
             self._running = False
+            self._pdf_context = False
             logger.info("Notebook stopped.")
 
     def __enter__(self):
@@ -316,6 +322,7 @@ class TokenlessLLM:
     def chat(self, message: str, system_prompt: Optional[str] = None, **kwargs) -> str:
         """Single-turn chat. Returns the assistant reply as a string."""
         self._assert_inference()
+        kwargs.setdefault("timeout", 3600)
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -337,6 +344,7 @@ class TokenlessLLM:
         gpt_oss_poll_interval: float = 5.0,
         gpt_oss_kernel_session_timeout: int = 36_000,
         gpt_oss_accelerator: Optional[str] = "NvidiaTeslaT4",
+        page_progress: bool = True,
         **kwargs,
     ) -> str:
         """
@@ -348,6 +356,13 @@ class TokenlessLLM:
         """
         self._assert_running()
         if self._openai_client is not None and self._base_url is not None:
+            if self._pdf_context and len(message) >= PDF_PAGE_MAP_MIN_PROMPT_CHARS:
+                return self._send_pdf_page_mapped(
+                    message,
+                    system_prompt=system_prompt,
+                    page_progress=page_progress,
+                    **kwargs,
+                )
             return self.chat(message, system_prompt=system_prompt, **kwargs)
 
         if self.model == GPT_OSS_MODEL_ID:
@@ -430,6 +445,81 @@ class TokenlessLLM:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _send_pdf_page_mapped(
+        self,
+        message: str,
+        *,
+        system_prompt: Optional[str] = None,
+        page_progress: bool = True,
+        **kwargs,
+    ) -> str:
+        pages = self._fetch_pdf_pages()
+        if not pages:
+            raise RuntimeError("PDF context is enabled, but the server returned no PDF pages.")
+
+        outputs: list[str] = []
+        total = len(pages)
+        for index, page in enumerate(pages, start=1):
+            page_number = int(page.get("page") or index)
+            page_markdown = str(page.get("markdown") or "")
+            if page_progress:
+                sys.stderr.write(f"Tokenless PDF page {index}/{total}: sending page {page_number}\n")
+                sys.stderr.flush()
+            page_system_prompt = self._pdf_page_system_prompt(
+                page_number,
+                total,
+                page_markdown,
+                system_prompt=system_prompt,
+            )
+            content = self.chat(message, system_prompt=page_system_prompt, **kwargs).strip()
+            if content:
+                outputs.append(f"## Page {page_number}\n\n{content}")
+            if page_progress:
+                if content:
+                    sys.stderr.write(
+                        f"Tokenless PDF page {index}/{total}: result for page {page_number}\n"
+                        f"{content}\n"
+                    )
+                else:
+                    sys.stderr.write(
+                        f"Tokenless PDF page {index}/{total}: no result for page {page_number}\n"
+                    )
+                sys.stderr.flush()
+
+        return "\n\n---\n\n".join(outputs).strip() or "No relevant content was found in the PDF pages."
+
+    def _fetch_pdf_pages(self) -> list[dict]:
+        self._assert_inference()
+        url = f"{self._base_url.rstrip('/')}/tokenless/pdf/pages"
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        pages = data.get("pages")
+        if not isinstance(pages, list):
+            raise RuntimeError(f"Unexpected PDF pages response from {url}: {data!r}")
+        return pages
+
+    @staticmethod
+    def _pdf_page_system_prompt(
+        page_number: int,
+        total_pages: int,
+        page_markdown: str,
+        *,
+        system_prompt: Optional[str] = None,
+    ) -> str:
+        context = (
+            "<tokenless_pdf_page_context>\n"
+            "You are processing one page from an uploaded PDF. Apply the user's prompt "
+            "only to this page. Return only findings supported by this page. If this "
+            "page has no relevant answer, return an empty response.\n\n"
+            f"PDF page {page_number} of {total_pages}:\n\n"
+            f"<pdf_markdown>\n{page_markdown}\n</pdf_markdown>\n"
+            "</tokenless_pdf_page_context>"
+        )
+        if system_prompt:
+            return f"{system_prompt}\n\n{context}"
+        return context
 
     def _assert_running(self):
         if not self._running:

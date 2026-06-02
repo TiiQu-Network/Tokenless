@@ -1,4 +1,5 @@
 import pytest
+import requests
 
 from tokenless import GPT_OSS_MODEL_ID, TokenlessLLM
 
@@ -161,6 +162,7 @@ def test_start_waits_for_public_endpoint_readiness(monkeypatch):
 
     assert result == "https://ready.trycloudflare.com"
     assert llm.base_url == "https://ready.trycloudflare.com"
+    assert llm._tunnel.timeout is None
     assert requests == [("https://ready.trycloudflare.com/api/version", 10)]
 
 
@@ -195,3 +197,74 @@ def test_chat_uses_long_timeout_for_pdf_page_mapping():
 
     assert llm.chat("hello") == "ok"
     assert calls[0]["timeout"] == 3600
+
+
+def test_pdf_page_mapping_submits_and_polls_async_jobs(monkeypatch):
+    llm = make_llm()
+    llm._running = True
+    llm._pdf_context = True
+    llm._base_url = "https://ready.trycloudflare.com"
+    llm._openai_client = object()
+    calls = []
+    statuses = iter(["running", "complete"])
+
+    class Response:
+        def __init__(self, data):
+            self.data = data
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.data
+
+    def fake_get(url, timeout):
+        calls.append(("get", url, timeout))
+        if url.endswith("/tokenless/pdf/pages"):
+            return Response({"pages": [{"page": 4, "markdown": "page markdown"}]})
+        status = next(statuses)
+        return Response({"status": status, "content": "page result"})
+
+    def fake_post(url, json, timeout):
+        calls.append(("post", url, json, timeout))
+        return Response({"status": "running"})
+
+    monkeypatch.setattr("tokenless.client.requests.get", fake_get)
+    monkeypatch.setattr("tokenless.client.requests.post", fake_post)
+    monkeypatch.setattr("tokenless.client.PDF_PAGE_JOB_POLL_INTERVAL", 0)
+
+    result = llm.send("x" * 4000, page_progress=False)
+
+    assert result == "## Page 4\n\npage result"
+    post = next(call for call in calls if call[0] == "post")
+    assert post[1].startswith("https://ready.trycloudflare.com/tokenless/jobs/")
+    assert post[2]["messages"][0]["content"].startswith("<tokenless_pdf_page_context>")
+    assert len([call for call in calls if call[0] == "get"]) == 3
+
+
+def test_pdf_page_job_submit_retry_reuses_job_id(monkeypatch):
+    llm = make_llm()
+    llm._running = True
+    llm._base_url = "https://ready.trycloudflare.com"
+    post_urls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"status": "complete", "content": "done"}
+
+    def fake_post(url, json, timeout):
+        post_urls.append(url)
+        if len(post_urls) == 1:
+            raise requests.ConnectionError("temporary tunnel failure")
+        return Response()
+
+    monkeypatch.setattr("tokenless.client.requests.post", fake_post)
+    monkeypatch.setattr("tokenless.client.requests.get", lambda url, timeout: Response())
+    monkeypatch.setattr("tokenless.client.PDF_PAGE_JOB_POLL_INTERVAL", 0)
+
+    assert llm._run_pdf_page_job("prompt") == "done"
+    assert len(post_urls) == 2
+    assert post_urls[0] == post_urls[1]

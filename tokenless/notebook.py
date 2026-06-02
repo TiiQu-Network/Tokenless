@@ -598,7 +598,8 @@ class KaggleNotebookManager:
 
             deadline = time.time() + status_timeout
             public_url_pattern = re.compile(
-                r"TOKENLESS_PUBLIC_URL=(https://[-a-zA-Z0-9.]+\.trycloudflare\.com)"
+                rf"TOKENLESS_PUBLIC_URL topic={re.escape(rendezvous_topic)} "
+                r"url=(https://[-a-zA-Z0-9.]+\.trycloudflare\.com)"
             )
             while time.time() < deadline:
                 try:

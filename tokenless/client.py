@@ -9,6 +9,7 @@ import logging
 import sys
 import threading
 import time
+import uuid
 from typing import Optional
 
 import openai
@@ -24,6 +25,8 @@ from tokenless.tunnel import TunnelManager
 
 logger = logging.getLogger(__name__)
 PDF_PAGE_MAP_MIN_PROMPT_CHARS = 4000
+PDF_PAGE_JOB_POLL_INTERVAL = 2.0
+PDF_PAGE_JOB_TIMEOUT = 3600
 
 SUPPORTED_MODELS = [
     "llama3.1-8b",
@@ -273,7 +276,7 @@ class TokenlessLLM:
             logger.info("Waiting for tunnel URL (timeout=%ds)...", timeout)
             if progress_callback:
                 progress_callback("Connecting to public endpoint")
-            self._base_url = self._tunnel.get_url(timeout=timeout)
+            self._base_url = self._notebook.public_url.rstrip("/")
             self._wait_for_endpoint_ready(
                 self._base_url,
                 timeout=timeout,
@@ -472,7 +475,11 @@ class TokenlessLLM:
                 page_markdown,
                 system_prompt=system_prompt,
             )
-            content = self.chat(message, system_prompt=page_system_prompt, **kwargs).strip()
+            content = self._run_pdf_page_job(
+                message,
+                system_prompt=page_system_prompt,
+                **kwargs,
+            ).strip()
             if content:
                 outputs.append(f"## Page {page_number}\n\n{content}")
             if page_progress:
@@ -488,6 +495,58 @@ class TokenlessLLM:
                 sys.stderr.flush()
 
         return "\n\n---\n\n".join(outputs).strip() or "No relevant content was found in the PDF pages."
+
+    def _run_pdf_page_job(
+        self,
+        message: str,
+        *,
+        system_prompt: Optional[str] = None,
+        **kwargs,
+    ) -> str:
+        job_id = uuid.uuid4().hex
+        job_url = f"{self._base_url.rstrip('/')}/tokenless/jobs/{job_id}"
+        timeout = kwargs.pop("timeout", PDF_PAGE_JOB_TIMEOUT)
+        deadline = time.time() + timeout
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": message})
+        payload = {"model": self.model, "messages": messages, **kwargs}
+
+        self._retry_pdf_job_request(
+            "submit",
+            deadline,
+            lambda: requests.post(job_url, json=payload, timeout=60),
+        )
+        while time.time() < deadline:
+            response = self._retry_pdf_job_request(
+                "poll",
+                deadline,
+                lambda: requests.get(job_url, timeout=60),
+            )
+            data = response.json()
+            status = data.get("status")
+            if status == "complete":
+                return str(data.get("content") or "")
+            if status == "error":
+                raise RuntimeError(f"PDF page job {job_id} failed: {data.get('error')}")
+            if status != "running":
+                raise RuntimeError(f"Unexpected PDF page job response from {job_url}: {data!r}")
+            time.sleep(PDF_PAGE_JOB_POLL_INTERVAL)
+        raise TimeoutError(f"Timed out after {timeout}s waiting for PDF page job {job_id}.")
+
+    @staticmethod
+    def _retry_pdf_job_request(action: str, deadline: float, request) -> requests.Response:
+        last_error = None
+        while time.time() < deadline:
+            try:
+                response = request()
+                response.raise_for_status()
+                return response
+            except requests.RequestException as e:
+                last_error = e
+                time.sleep(PDF_PAGE_JOB_POLL_INTERVAL)
+        raise TimeoutError(f"Timed out during PDF page job {action}. Last error: {last_error!r}")
 
     def _fetch_pdf_pages(self) -> list[dict]:
         self._assert_inference()

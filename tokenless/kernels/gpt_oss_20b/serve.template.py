@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -24,7 +25,9 @@ ERR = Path("/kaggle/working/tokenless_server_error.txt")
 CLOUDFLARED_LOG = Path("/tmp/tokenless_cloudflared.log")
 PDF_MARKDOWN = Path("/kaggle/working/tokenless_pdf_context.md")
 PAGE_MAP_MIN_PROMPT_CHARS = 4000
-PAGE_MAP_REQUEST_TIMEOUT = 900
+PAGE_MAP_REQUEST_TIMEOUT = 3600
+PAGE_JOBS = {}
+PAGE_JOBS_LOCK = threading.Lock()
 
 
 def _fail(msg: str) -> None:
@@ -321,6 +324,32 @@ def _assistant_content(response_payload: dict) -> str:
     return str(message.get("content") or "").strip()
 
 
+def _run_page_job(job_id: str, payload: dict) -> None:
+    try:
+        content = _assistant_content(_post_ollama_chat(payload))
+        update = {"status": "complete", "content": content}
+    except Exception as e:  # noqa: BLE001 - return remote inference failures to the client
+        update = {"status": "error", "error": repr(e)}
+    with PAGE_JOBS_LOCK:
+        PAGE_JOBS[job_id] = update
+
+
+def _start_page_job(job_id: str, payload: dict) -> dict:
+    with PAGE_JOBS_LOCK:
+        job = PAGE_JOBS.get(job_id)
+        if job is not None:
+            return job
+        PAGE_JOBS[job_id] = {"status": "running"}
+    threading.Thread(target=_run_page_job, args=(job_id, payload), daemon=True).start()
+    return {"status": "running"}
+
+
+def _get_page_job(job_id: str) -> dict | None:
+    with PAGE_JOBS_LOCK:
+        job = PAGE_JOBS.get(job_id)
+        return dict(job) if job is not None else None
+
+
 def _map_pdf_pages(payload: dict) -> dict:
     markdown = PDF_MARKDOWN.read_text(encoding="utf-8")
     pages = _split_pdf_pages(markdown)
@@ -405,6 +434,14 @@ class TokenlessProxy(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
+        job_match = re.fullmatch(r"/tokenless/jobs/([a-f0-9]+)", self.path.rstrip("/"))
+        if job_match:
+            job = _get_page_job(job_match.group(1))
+            if job is None:
+                self._send_json(404, {"error": "Unknown PDF page job."})
+                return
+            self._send_json(200, job)
+            return
         if self.path.rstrip("/") == "/tokenless/pdf/pages":
             if not PDF_MARKDOWN.exists():
                 self._send_json(404, {"error": "PDF Markdown context is not available."})
@@ -437,6 +474,10 @@ class TokenlessProxy(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length)
             payload = json.loads(body.decode("utf-8"))
+            job_match = re.fullmatch(r"/tokenless/jobs/([a-f0-9]+)", self.path.rstrip("/"))
+            if job_match:
+                self._send_json(202, _start_page_job(job_match.group(1), payload))
+                return
             if self.path.rstrip("/") == "/v1/chat/completions":
                 if _should_map_pdf_pages(payload):
                     self._send_json(200, _map_pdf_pages(payload))
@@ -511,8 +552,6 @@ print("Starting public tunnel...", flush=True)
 _publish("Starting public tunnel")
 target_port = 8000 if PDF_MARKDOWN.exists() else 11434
 if PDF_MARKDOWN.exists():
-    import threading
-
     threading.Thread(target=_start_proxy, daemon=True).start()
     time.sleep(2)
 os.system(
@@ -536,7 +575,7 @@ if not url:
     _fail("Timed out waiting for cloudflared public URL.")
 
 OUT.write_text(url, encoding="utf-8")
-print(f"TOKENLESS_PUBLIC_URL={url}", flush=True)
+print(f"TOKENLESS_PUBLIC_URL topic={NTFY_TOPIC} url={url}", flush=True)
 _publish(url)
 print("Published TOKENLESS_PUBLIC_URL to rendezvous channel.", flush=True)
 

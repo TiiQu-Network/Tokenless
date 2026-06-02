@@ -57,3 +57,31 @@ def test_gpt_oss_server_template_maps_large_pdf_prompts_by_page():
     assert "def _map_pdf_pages" in body
     assert "Running page-mapped prompt on PDF page" in body
     assert "## Page {page_number}" in body
+
+
+def test_gpt_oss_server_template_exposes_async_pdf_page_jobs():
+    root = Path(__file__).resolve().parents[1]
+    body = (
+        root
+        / "tokenless"
+        / "kernels"
+        / "gpt_oss_20b"
+        / "serve.template.py"
+    ).read_text(encoding="utf-8")
+
+    assert "def _start_page_job" in body
+    assert "def _get_page_job" in body
+    assert 'r"/tokenless/jobs/([a-f0-9]+)"' in body
+
+
+def test_gpt_oss_server_template_marks_public_url_with_rendezvous_topic():
+    root = Path(__file__).resolve().parents[1]
+    body = (
+        root
+        / "tokenless"
+        / "kernels"
+        / "gpt_oss_20b"
+        / "serve.template.py"
+    ).read_text(encoding="utf-8")
+
+    assert "TOKENLESS_PUBLIC_URL topic={NTFY_TOPIC} url={url}" in body

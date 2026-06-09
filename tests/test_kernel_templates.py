@@ -85,3 +85,39 @@ def test_gpt_oss_server_template_marks_public_url_with_rendezvous_topic():
     ).read_text(encoding="utf-8")
 
     assert "TOKENLESS_PUBLIC_URL topic={NTFY_TOPIC} url={url}" in body
+<<<<<<< HEAD
+=======
+
+
+def test_gpt_oss_server_template_does_not_delay_public_url_publish():
+    root = Path(__file__).resolve().parents[1]
+    body = (
+        root
+        / "tokenless"
+        / "kernels"
+        / "gpt_oss_20b"
+        / "serve.template.py"
+    ).read_text(encoding="utf-8")
+
+    assert "NTFY_URL_PUBLISH_DELAY" not in body
+    assert "url_publish_not_before" not in body
+    assert "publish_delay" not in body
+
+
+def test_gpt_oss_server_template_logs_url_after_ntfy_publish_attempt():
+    root = Path(__file__).resolve().parents[1]
+    body = (
+        root
+        / "tokenless"
+        / "kernels"
+        / "gpt_oss_20b"
+        / "serve.template.py"
+    ).read_text(encoding="utf-8")
+
+    ntfy_publish = body.index("_publish(url)")
+    log_fallback_marker = body.index(
+        'print(f"TOKENLESS_PUBLIC_URL topic={NTFY_TOPIC} url={url}", flush=True)'
+    )
+
+    assert ntfy_publish < log_fallback_marker
+>>>>>>> 7f54bf7 (JSON extractor)

@@ -99,6 +99,31 @@ answer = llm.start(
 )
 ```
 
+<<<<<<< HEAD
+=======
+For page-by-page JSON extraction, enable PDF context and call `send()`. Malformed
+non-empty page responses are automatically sent back to the same running
+`gpt-oss:20b` endpoint for JSON-only repair. Each repair is validated locally
+before it is included in the final concatenated JSON.
+
+```python
+import json
+
+llm = TokenlessLLM(model="gpt-oss:20b")
+llm.start(file_path="paper.pdf", pdf_context=True)
+
+result = llm.send(
+    extraction_prompt,
+    repair_malformed_json=True,
+    json_repair_attempts=2,
+)
+data = json.loads(result)
+```
+
+JSON repair is enabled by default. Set `repair_malformed_json=False` to skip
+malformed pages, or change `json_repair_attempts` to control the retry limit.
+
+>>>>>>> 7f54bf7 (JSON extractor)
 ## Supported Models
 
 | Model | Backend | Notes |

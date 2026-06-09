@@ -5,6 +5,7 @@ OpenAI-compatible endpoint backed by Kaggle's free GPUs.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import threading
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 PDF_PAGE_MAP_MIN_PROMPT_CHARS = 4000
 PDF_PAGE_JOB_POLL_INTERVAL = 2.0
 PDF_PAGE_JOB_TIMEOUT = 3600
+PDF_JSON_REPAIR_MAX_TOKENS = 16_384
 
 SUPPORTED_MODELS = [
     "llama3.1-8b",
@@ -219,6 +221,15 @@ class TokenlessLLM:
                 gpt_oss_accelerator=gpt_oss_accelerator,
                 progress_callback=progress.update,
             )
+        except BaseException:
+            logger.exception("Error occurred while starting the notebook")
+            self._notebook.stop()
+            self._tunnel.close()
+            self._base_url = None
+            self._openai_client = None
+            self._running = False
+            self._pdf_context = False
+            raise
         finally:
             progress.__exit__(*sys.exc_info())
 
@@ -276,12 +287,7 @@ class TokenlessLLM:
             logger.info("Waiting for tunnel URL (timeout=%ds)...", timeout)
             if progress_callback:
                 progress_callback("Connecting to public endpoint")
-            self._base_url = self._notebook.public_url.rstrip("/")
-            self._wait_for_endpoint_ready(
-                self._base_url,
-                timeout=timeout,
-                progress_callback=progress_callback,
-            )
+            self._base_url = self._tunnel.get_url(timeout=timeout)
             self._openai_client = openai.OpenAI(
                 base_url=f"{self._base_url}/v1",
                 api_key="kaggle-free",  # dummy key — no auth needed
@@ -348,6 +354,8 @@ class TokenlessLLM:
         gpt_oss_kernel_session_timeout: int = 36_000,
         gpt_oss_accelerator: Optional[str] = "NvidiaTeslaT4",
         page_progress: bool = True,
+        repair_malformed_json: bool = True,
+        json_repair_attempts: int = 2,
         **kwargs,
     ) -> str:
         """
@@ -364,6 +372,8 @@ class TokenlessLLM:
                     message,
                     system_prompt=system_prompt,
                     page_progress=page_progress,
+                    repair_malformed_json=repair_malformed_json,
+                    json_repair_attempts=json_repair_attempts,
                     **kwargs,
                 )
             return self.chat(message, system_prompt=system_prompt, **kwargs)
@@ -455,19 +465,28 @@ class TokenlessLLM:
         *,
         system_prompt: Optional[str] = None,
         page_progress: bool = True,
+        repair_malformed_json: bool = True,
+        json_repair_attempts: int = 2,
         **kwargs,
     ) -> str:
+        if json_repair_attempts < 0:
+            raise ValueError("json_repair_attempts must be zero or greater.")
+
         pages = self._fetch_pdf_pages()
         if not pages:
             raise RuntimeError("PDF context is enabled, but the server returned no PDF pages.")
 
-        outputs: list[str] = []
+        outputs: list[object] = []
+        page_job_kwargs = dict(kwargs)
+        page_job_kwargs.setdefault("max_tokens", PDF_JSON_REPAIR_MAX_TOKENS)
         total = len(pages)
         for index, page in enumerate(pages, start=1):
             page_number = int(page.get("page") or index)
             page_markdown = str(page.get("markdown") or "")
             if page_progress:
-                sys.stderr.write(f"Tokenless PDF page {index}/{total}: sending page {page_number}\n")
+                sys.stderr.write(
+                    f"Tokenless PDF page {index}/{total}: sending page {page_number}\n"
+                )
                 sys.stderr.flush()
             page_system_prompt = self._pdf_page_system_prompt(
                 page_number,
@@ -478,23 +497,193 @@ class TokenlessLLM:
             content = self._run_pdf_page_job(
                 message,
                 system_prompt=page_system_prompt,
-                **kwargs,
+                **page_job_kwargs,
             ).strip()
-            if content:
-                outputs.append(f"## Page {page_number}\n\n{content}")
-            if page_progress:
-                if content:
+            page_outputs = self._extract_json_values(content)
+            repaired = False
+            if (
+                not page_outputs
+                and content
+                and repair_malformed_json
+                and json_repair_attempts
+            ):
+                if page_progress:
                     sys.stderr.write(
-                        f"Tokenless PDF page {index}/{total}: result for page {page_number}\n"
-                        f"{content}\n"
+                        f"Tokenless PDF page {index}/{total}: repairing malformed JSON "
+                        f"from page {page_number}\n"
+                    )
+                    sys.stderr.flush()
+                page_outputs = self._repair_pdf_page_json(
+                    message,
+                    malformed_content=content,
+                    page_system_prompt=page_system_prompt,
+                    schema_hint=outputs[-1] if outputs else None,
+                    attempts=json_repair_attempts,
+                    **page_job_kwargs,
+                )
+                repaired = bool(page_outputs)
+            outputs.extend(page_outputs)
+            if page_progress:
+                if repaired:
+                    sys.stderr.write(
+                        f"Tokenless PDF page {index}/{total}: repaired JSON from "
+                        f"page {page_number}\n"
+                    )
+                elif page_outputs:
+                    sys.stderr.write(
+                        f"Tokenless PDF page {index}/{total}: extracted JSON from "
+                        f"page {page_number}\n"
                     )
                 else:
                     sys.stderr.write(
-                        f"Tokenless PDF page {index}/{total}: no result for page {page_number}\n"
+                        f"Tokenless PDF page {index}/{total}: no JSON result for "
+                        f"page {page_number}\n"
                     )
                 sys.stderr.flush()
 
-        return "\n\n---\n\n".join(outputs).strip() or "No relevant content was found in the PDF pages."
+        return json.dumps(self._concatenate_json_values(outputs), ensure_ascii=False)
+
+    def _repair_pdf_page_json(
+        self,
+        original_message: str,
+        *,
+        malformed_content: str,
+        page_system_prompt: str,
+        schema_hint: Optional[object],
+        attempts: int,
+        **kwargs,
+    ) -> list[object]:
+        repair_kwargs = dict(kwargs)
+        repair_kwargs["temperature"] = 0
+        max_tokens = repair_kwargs.get("max_tokens")
+        if not isinstance(max_tokens, int) or max_tokens < PDF_JSON_REPAIR_MAX_TOKENS:
+            repair_kwargs["max_tokens"] = PDF_JSON_REPAIR_MAX_TOKENS
+
+        schema_text = (
+            json.dumps(self._json_shape_hint(schema_hint), ensure_ascii=False)
+            if schema_hint is not None
+            else "No earlier valid page response is available."
+        )
+        repair_system_prompt = (
+            f"{page_system_prompt}\n\n"
+            "<tokenless_json_repair_agent>\n"
+            "You are a JSON repair agent. Re-read the PDF page context and regenerate "
+            "the answer to the original extraction request as one complete valid JSON "
+            "object or array. Preserve all recoverable facts, match the earlier valid "
+            "response schema when applicable, and do not return Markdown fences, "
+            "analysis, comments, or trailing text.\n"
+            "</tokenless_json_repair_agent>"
+        )
+
+        candidate = malformed_content
+        for attempt in range(1, attempts + 1):
+            repair_message = (
+                "Original extraction request:\n"
+                f"{original_message}\n\n"
+                "Earlier valid page response to use only as a schema hint:\n"
+                f"{schema_text}\n\n"
+                f"Malformed response from repair attempt {attempt - 1}:\n"
+                f"{candidate}\n\n"
+                "Return the corrected, complete JSON now."
+            )
+            candidate = self._run_pdf_page_job(
+                repair_message,
+                system_prompt=repair_system_prompt,
+                **repair_kwargs,
+            ).strip()
+            repaired_values = self._extract_json_values(candidate)
+            if repaired_values:
+                return repaired_values
+
+        return []
+
+    @classmethod
+    def _json_shape_hint(cls, value: object, depth: int = 0) -> object:
+        if depth >= 4:
+            return type(value).__name__
+        if isinstance(value, dict):
+            return {
+                key: cls._json_shape_hint(item, depth + 1)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._json_shape_hint(value[0], depth + 1)] if value else []
+        if value is None:
+            return None
+        return type(value).__name__
+
+    @staticmethod
+    def _extract_json_values(content: str) -> list[object]:
+        """Extract JSON objects and arrays from model text, including fenced JSON."""
+        values: list[object] = []
+        start: Optional[int] = None
+        stack: list[str] = []
+        in_string = False
+        escaped = False
+        matching = {"}": "{", "]": "["}
+
+        for index, char in enumerate(content):
+            if start is None:
+                if char in "{[":
+                    start = index
+                    stack = [char]
+                continue
+
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char in "{[":
+                stack.append(char)
+            elif char in "}]":
+                if not stack or stack[-1] != matching[char]:
+                    start = None
+                    stack = []
+                    continue
+                stack.pop()
+                if not stack:
+                    candidate = content[start : index + 1]
+                    try:
+                        value = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        pass
+                    else:
+                        if isinstance(value, (dict, list)):
+                            values.append(value)
+                    start = None
+
+        return values
+
+    @staticmethod
+    def _concatenate_json_values(values: list[object]) -> object:
+        """Join repeated list-valued JSON wrappers, or return one flattened array."""
+        if values and all(isinstance(value, dict) for value in values):
+            first_keys = set(values[0])
+            if first_keys and all(
+                set(value) == first_keys
+                and all(isinstance(item, list) for item in value.values())
+                for value in values
+            ):
+                merged = {key: [] for key in values[0]}
+                for value in values:
+                    for key, items in value.items():
+                        merged[key].extend(items)
+                return merged
+
+        merged_values: list[object] = []
+        for value in values:
+            if isinstance(value, list):
+                merged_values.extend(value)
+            else:
+                merged_values.append(value)
+        return merged_values
 
     def _run_pdf_page_job(
         self,
@@ -592,30 +781,3 @@ class TokenlessLLM:
                 "result is available (smoke test or batch reply). Set TOKENLESS_PUBLIC_URL "
                 "to your notebook tunnel base URL (no /v1 suffix), then call .start() again."
             )
-
-    @staticmethod
-    def _wait_for_endpoint_ready(
-        base_url: str,
-        *,
-        timeout: int,
-        progress_callback=None,
-    ) -> None:
-        deadline = time.time() + timeout
-        health_url = f"{base_url.rstrip('/')}/api/version"
-        last_error = ""
-        while time.time() < deadline:
-            try:
-                response = requests.get(health_url, timeout=10)
-                response.raise_for_status()
-                if progress_callback:
-                    progress_callback("Public endpoint is ready")
-                return
-            except requests.RequestException as e:
-                last_error = repr(e)
-                if progress_callback:
-                    progress_callback("Waiting for public endpoint")
-                time.sleep(2)
-        raise RuntimeError(
-            f"Timed out after {timeout}s waiting for public endpoint readiness at "
-            f"{health_url}. Last error: {last_error}"
-        )

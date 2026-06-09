@@ -30,6 +30,8 @@ GPT_OSS_RESPONSE_FILENAME = "tokenless_model_response.txt"
 GPT_OSS_ERROR_FILENAME = "tokenless_model_error.txt"
 DEFAULT_GPT_OSS_KERNEL_SLUG = "tokenless-gpt-oss-20b"
 DEFAULT_GPT_OSS_SERVER_KERNEL_SLUG = "tokenless-gpt-oss-20b-server"
+NTFY_URL_REQUEST_ATTEMPTS = 5
+NTFY_URL_REQUEST_TIMEOUT_SECONDS = 2.0
 _GPT_OSS_SCRIPT_NAME = "run.py"
 _GPT_OSS_SERVER_SCRIPT_NAME = "serve.py"
 _GPT_OSS_TEMPLATE = (
@@ -186,6 +188,7 @@ class KaggleNotebookManager:
 
         if self.model == GPT_OSS_MODEL_ID:
             if (kaggle_prompt is None and input_path is None) or pdf_context:
+                self.kernel_ref = f"{owner}/{DEFAULT_GPT_OSS_SERVER_KERNEL_SLUG}"
                 self.public_url = self._start_ollama_gpt_oss_20b_server(
                     owner,
                     file_path=input_path,
@@ -196,7 +199,6 @@ class KaggleNotebookManager:
                     accelerator=gpt_oss_accelerator,
                     progress_callback=progress_callback,
                 )
-                self.kernel_ref = f"{owner}/{DEFAULT_GPT_OSS_SERVER_KERNEL_SLUG}"
                 logger.info("Kaggle GPT-OSS server ready (%s).", self.kernel_ref)
                 return
 
@@ -489,7 +491,7 @@ class KaggleNotebookManager:
                     self._temporary_dataset_slug,
                     e,
                 )
-        if self.kernel_ref and self.model == GPT_OSS_MODEL_ID and self.public_url:
+        if self.kernel_ref and self.model == GPT_OSS_MODEL_ID:
             try:
                 self._configure_api().kernels_delete(self.kernel_ref, no_confirm=True)
                 logger.info("Deleted Kaggle kernel %s.", self.kernel_ref)
@@ -610,28 +612,58 @@ class KaggleNotebookManager:
                 except queue.Empty:
                     pass
 
-                status = api.kernels_status(kernel_id)
-                st = status.status
-                if progress_callback and st != KernelWorkerStatus.RUNNING:
-                    progress_callback(f"Kaggle status: {st.name.lower()}")
-                if st == KernelWorkerStatus.ERROR:
-                    msg = status.failure_message or "unknown error"
-                    raise RuntimeError(f"Kaggle kernel run failed: {msg}")
-                if st == KernelWorkerStatus.CANCEL_REQUESTED:
-                    raise RuntimeError("Kaggle kernel run was cancelled (cancel requested).")
-                if st == KernelWorkerStatus.CANCEL_ACKNOWLEDGED:
-                    raise RuntimeError("Kaggle kernel run was cancelled.")
-                if st == KernelWorkerStatus.COMPLETE:
-                    raise RuntimeError(
-                        "Kaggle GPT-OSS server kernel completed before exposing a public URL."
-                    )
+                try:
+                    status = api.kernels_status(kernel_id)
+                except requests.RequestException:
+                    status = None
+                if status is not None:
+                    st = status.status
+                    if progress_callback and st != KernelWorkerStatus.RUNNING:
+                        progress_callback(f"Kaggle status: {st.name.lower()}")
+                    if st == KernelWorkerStatus.ERROR:
+                        msg = status.failure_message or "unknown error"
+                        raise RuntimeError(f"Kaggle kernel run failed: {msg}")
+                    if st == KernelWorkerStatus.CANCEL_REQUESTED:
+                        raise RuntimeError("Kaggle kernel run was cancelled (cancel requested).")
+                    if st == KernelWorkerStatus.CANCEL_ACKNOWLEDGED:
+                        raise RuntimeError("Kaggle kernel run was cancelled.")
+                    if st == KernelWorkerStatus.COMPLETE:
+                        raise RuntimeError(
+                            "Kaggle GPT-OSS server kernel completed before exposing a public URL."
+                        )
 
-                logs = api.kernels_logs(kernel_id) or ""
+                try:
+                    logs = api.kernels_logs(kernel_id) or ""
+                except requests.RequestException:
+                    logs = ""
                 if not isinstance(logs, str):
                     logs = json.dumps(logs)
                 match = public_url_pattern.search(logs)
                 if match:
-                    return match.group(1).rstrip("/")
+                    log_url = match.group(1).rstrip("/")
+                    for attempt in range(1, NTFY_URL_REQUEST_ATTEMPTS + 1):
+                        remaining = max(0.0, deadline - time.time())
+                        if remaining <= 0:
+                            break
+                        if progress_callback:
+                            progress_callback(
+                                f"Checking ntfy for public URL "
+                                f"({attempt}/{NTFY_URL_REQUEST_ATTEMPTS})"
+                            )
+                        try:
+                            url = public_url_queue.get(
+                                timeout=min(NTFY_URL_REQUEST_TIMEOUT_SECONDS, remaining)
+                            )
+                            if progress_callback:
+                                progress_callback("Public endpoint received")
+                            return url
+                        except queue.Empty:
+                            continue
+                    if progress_callback:
+                        progress_callback(
+                            "ntfy URL checks failed; recovering endpoint from Kaggle logs"
+                        )
+                    return log_url
 
                 time.sleep(poll_interval)
 
@@ -648,33 +680,37 @@ class KaggleNotebookManager:
     ) -> None:
         """Listen for the one-time URL message published by the Kaggle script."""
         pattern = re.compile(r"https://[-a-zA-Z0-9.]+\.trycloudflare\.com")
-        try:
-            with requests.get(
-                f"https://ntfy.sh/{topic}/json",
-                stream=True,
-                timeout=(10, timeout),
-            ) as response:
-                response.raise_for_status()
-                for line in response.iter_lines(decode_unicode=True):
-                    if public_url_queue.full():
-                        return
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if event.get("event") != "message":
-                        continue
-                    message = str(event.get("message", ""))
-                    match = pattern.search(message)
-                    if match:
-                        public_url_queue.put(match.group(0).rstrip("/"))
-                        return
-                    if progress_callback and message:
-                        progress_callback(message)
-        except requests.RequestException as e:
-            logger.warning("Public URL rendezvous listener failed: %s", e)
+        deadline = time.time() + timeout
+        while time.time() < deadline and not public_url_queue.full():
+            remaining = max(1.0, deadline - time.time())
+            try:
+                with requests.get(
+                    f"https://ntfy.sh/{topic}/json",
+                    stream=True,
+                    timeout=(10, min(30.0, remaining)),
+                ) as response:
+                    response.raise_for_status()
+                    for line in response.iter_lines(decode_unicode=True):
+                        if public_url_queue.full():
+                            return
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if event.get("event") != "message":
+                            continue
+                        message = str(event.get("message", ""))
+                        match = pattern.search(message)
+                        if match:
+                            public_url_queue.put(match.group(0).rstrip("/"))
+                            return
+                        if progress_callback and message:
+                            progress_callback(message)
+            except requests.RequestException:
+                pass
+            time.sleep(min(1.0, max(0.0, deadline - time.time())))
 
     def _configure_api(self) -> Any:
         KaggleApi = _kaggle_api_cls()

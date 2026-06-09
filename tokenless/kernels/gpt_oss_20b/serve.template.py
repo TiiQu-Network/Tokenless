@@ -42,6 +42,10 @@ def _run(cmd: str, error: str) -> None:
 
 def _publish(message: str) -> None:
     if not NTFY_TOPIC or NTFY_TOPIC.startswith("__TOKENLESS_"):
+<<<<<<< HEAD
+=======
+        print(f"NTFY_TOPIC is not set; skipping publish of message: {message}", flush=True)
+>>>>>>> 7f54bf7 (JSON extractor)
         return
     try:
         req = urllib.request.Request(
@@ -51,7 +55,11 @@ def _publish(message: str) -> None:
         )
         urllib.request.urlopen(req, timeout=10).read()
     except (urllib.error.URLError, TimeoutError):
+<<<<<<< HEAD
         pass
+=======
+        print(f"Failed to publish message to NTFY: {message}", flush=True)
+>>>>>>> 7f54bf7 (JSON extractor)
 
 
 def _decode_b64(value: str) -> str:
@@ -252,8 +260,13 @@ def _inject_pdf_context(payload: dict) -> dict:
     selected_context = _select_pdf_context(markdown, question)
     context = (
         "You are answering questions about an uploaded PDF. Use the source-aware "
+<<<<<<< HEAD
         "Markdown context below as the source of truth. Each block has page and "
         "section source markers. If the answer is not in the PDF, say you cannot "
+=======
+        "Markdown context below as the source of truth. Each block has page and section "
+        "source markers. If the answer is not in the PDF, say you cannot "
+>>>>>>> 7f54bf7 (JSON extractor)
         "find it in the document.\n\n"
         f"<pdf_markdown>\n{selected_context}\n</pdf_markdown>"
     )
@@ -575,9 +588,15 @@ if not url:
     _fail("Timed out waiting for cloudflared public URL.")
 
 OUT.write_text(url, encoding="utf-8")
+<<<<<<< HEAD
 print(f"TOKENLESS_PUBLIC_URL topic={NTFY_TOPIC} url={url}", flush=True)
 _publish(url)
 print("Published TOKENLESS_PUBLIC_URL to rendezvous channel.", flush=True)
+=======
+_publish(url)
+print("Published TOKENLESS_PUBLIC_URL to rendezvous channel.", flush=True)
+print(f"TOKENLESS_PUBLIC_URL topic={NTFY_TOPIC} url={url}", flush=True)
+>>>>>>> 7f54bf7 (JSON extractor)
 
 print("Tokenless GPT-OSS server is ready. Keeping Kaggle kernel alive...", flush=True)
 

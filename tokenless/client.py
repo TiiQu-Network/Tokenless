@@ -5,13 +5,18 @@ OpenAI-compatible endpoint backed by Kaggle's free GPUs.
 
 from __future__ import annotations
 
+import base64
+import ipaddress
 import json
 import logging
+import socket
 import sys
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import openai
 import requests
@@ -28,7 +33,36 @@ logger = logging.getLogger(__name__)
 PDF_PAGE_MAP_MIN_PROMPT_CHARS = 4000
 PDF_PAGE_JOB_POLL_INTERVAL = 2.0
 PDF_PAGE_JOB_TIMEOUT = 3600
+PDF_DOCUMENT_JOB_STALL_TIMEOUT = 3600
 PDF_JSON_REPAIR_MAX_TOKENS = 16_384
+DNS_OVER_HTTPS_URL = "https://dns.google/resolve"
+
+_ORIGINAL_GETADDRINFO = getattr(
+    socket,
+    "_tokenless_original_getaddrinfo",
+    socket.getaddrinfo,
+)
+setattr(socket, "_tokenless_original_getaddrinfo", _ORIGINAL_GETADDRINFO)
+_DNS_OVERRIDES: dict[str, tuple[str, ...]] = {}
+_DNS_OVERRIDES_LOCK = threading.Lock()
+
+
+def _tokenless_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    normalized = host.decode("ascii") if isinstance(host, bytes) else str(host)
+    with _DNS_OVERRIDES_LOCK:
+        addresses = _DNS_OVERRIDES.get(normalized.casefold(), ())
+    if not addresses:
+        return _ORIGINAL_GETADDRINFO(host, port, family, type, proto, flags)
+
+    results = []
+    for address in addresses:
+        results.extend(
+            _ORIGINAL_GETADDRINFO(address, port, family, type, proto, flags)
+        )
+    return results
+
+
+socket.getaddrinfo = _tokenless_getaddrinfo
 
 SUPPORTED_MODELS = [
     "llama3.1-8b",
@@ -288,6 +322,11 @@ class TokenlessLLM:
             if progress_callback:
                 progress_callback("Connecting to public endpoint")
             self._base_url = self._tunnel.get_url(timeout=timeout)
+            self._wait_for_endpoint_ready(
+                self._base_url,
+                timeout=timeout,
+                progress_callback=progress_callback,
+            )
             self._openai_client = openai.OpenAI(
                 base_url=f"{self._base_url}/v1",
                 api_key="kaggle-free",  # dummy key — no auth needed
@@ -349,6 +388,8 @@ class TokenlessLLM:
         message: str,
         system_prompt: Optional[str] = None,
         *,
+        file_path: Optional[str] = None,
+        file_upload_timeout: int = 3600,
         gpt_oss_status_timeout: int = 36_000,
         gpt_oss_poll_interval: float = 5.0,
         gpt_oss_kernel_session_timeout: int = 36_000,
@@ -363,10 +404,13 @@ class TokenlessLLM:
 
         In endpoint mode this delegates to ``chat()``. For ``gpt-oss:20b``,
         ``start()`` creates the endpoint so repeated ``send()`` calls reuse the same
-        Kaggle kernel and downloaded model.
+        Kaggle kernel and downloaded model. Passing ``file_path`` uploads a PDF to
+        the running endpoint and replaces any previous PDF context before inference.
         """
         self._assert_running()
         if self._openai_client is not None and self._base_url is not None:
+            if file_path is not None:
+                self._upload_pdf_context(file_path, timeout=file_upload_timeout)
             if self._pdf_context and len(message) >= PDF_PAGE_MAP_MIN_PROMPT_CHARS:
                 return self._send_pdf_page_mapped(
                     message,
@@ -379,6 +423,11 @@ class TokenlessLLM:
             return self.chat(message, system_prompt=system_prompt, **kwargs)
 
         if self.model == GPT_OSS_MODEL_ID:
+            if file_path is not None:
+                raise RuntimeError(
+                    "send(file_path=...) requires a running Tokenless endpoint. "
+                    "Call start() without file_path first."
+                )
             if kwargs:
                 unsupported = ", ".join(sorted(kwargs))
                 raise TypeError(
@@ -459,6 +508,148 @@ class TokenlessLLM:
     # Internal
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _wait_for_endpoint_ready(
+        base_url: str,
+        *,
+        timeout: int,
+        progress_callback=None,
+    ) -> None:
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero.")
+
+        url = f"{base_url.rstrip('/')}/api/version"
+        hostname = urlparse(base_url).hostname
+        deadline = time.time() + timeout
+        last_error = None
+        last_doh_attempt = 0.0
+        while time.time() < deadline:
+            if progress_callback:
+                progress_callback("Waiting for endpoint DNS and health check")
+            try:
+                response = requests.get(
+                    url,
+                    timeout=min(10, max(1, deadline - time.time())),
+                )
+                response.raise_for_status()
+                return
+            except requests.RequestException as exc:
+                last_error = exc
+                now = time.time()
+                if hostname and now - last_doh_attempt >= 15:
+                    last_doh_attempt = now
+                    if progress_callback:
+                        progress_callback("Resolving endpoint via DNS-over-HTTPS")
+                    try:
+                        TokenlessLLM._register_doh_override(hostname)
+                    except requests.RequestException as doh_exc:
+                        logger.debug(
+                            "DNS-over-HTTPS lookup failed for %s: %r",
+                            hostname,
+                            doh_exc,
+                        )
+                time.sleep(PDF_PAGE_JOB_POLL_INTERVAL)
+
+        raise TimeoutError(
+            f"Timed out after {timeout}s waiting for endpoint {base_url}. "
+            f"Last error: {last_error!r}"
+        )
+
+    @staticmethod
+    def _register_doh_override(hostname: str) -> tuple[str, ...]:
+        response = requests.get(
+            DNS_OVER_HTTPS_URL,
+            params={"name": hostname, "type": "A"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+        addresses = []
+        for answer in data.get("Answer") or []:
+            value = str(answer.get("data") or "")
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError:
+                continue
+            if address.version == 4:
+                addresses.append(str(address))
+
+        if not addresses:
+            raise requests.ConnectionError(
+                f"DNS-over-HTTPS returned no IPv4 address for {hostname}: {data!r}"
+            )
+
+        unique_addresses = tuple(dict.fromkeys(addresses))
+        with _DNS_OVERRIDES_LOCK:
+            _DNS_OVERRIDES[hostname.casefold()] = unique_addresses
+        logger.info(
+            "Using DNS-over-HTTPS addresses for %s: %s",
+            hostname,
+            ", ".join(unique_addresses),
+        )
+        return unique_addresses
+
+    def _upload_pdf_context(self, file_path: str, *, timeout: int) -> None:
+        self._assert_inference()
+        if timeout <= 0:
+            raise ValueError("file_upload_timeout must be greater than zero.")
+
+        path = Path(file_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Input file does not exist: {path}")
+        if not path.is_file():
+            raise ValueError(f"Input path must be a file: {path}")
+        if path.suffix.lower() != ".pdf":
+            raise ValueError("Only PDF files are supported by file_path right now.")
+
+        job_path = f"/tokenless/pdf/upload/{uuid.uuid4().hex}"
+        deadline = time.time() + timeout
+        self._pdf_context = False
+        encoded_filename = base64.b64encode(path.name.encode("utf-8")).decode("ascii")
+
+        def submit_upload() -> requests.Response:
+            with path.open("rb") as pdf_file:
+                return requests.post(
+                    f"{self._base_url.rstrip('/')}{job_path}",
+                    data=pdf_file,
+                    headers={
+                        "Content-Type": "application/pdf",
+                        "X-Tokenless-Filename-B64": encoded_filename,
+                    },
+                    timeout=min(300, max(1, deadline - time.time())),
+                )
+
+        response = self._retry_pdf_job_request(
+            "PDF upload",
+            deadline,
+            submit_upload,
+        )
+        data = response.json()
+        while time.time() < deadline:
+            status = data.get("status")
+            if status == "complete":
+                self._pdf_context = True
+                return
+            if status == "error":
+                raise RuntimeError(f"PDF upload failed: {data.get('error')}")
+            if status != "running":
+                raise RuntimeError(
+                    "Unexpected PDF upload response from "
+                    f"{self._base_url.rstrip('/')}{job_path}: {data!r}"
+                )
+            time.sleep(PDF_PAGE_JOB_POLL_INTERVAL)
+            response = self._retry_pdf_job_request(
+                "PDF conversion poll",
+                deadline,
+                lambda: requests.get(
+                    f"{self._base_url.rstrip('/')}{job_path}",
+                    timeout=60,
+                ),
+            )
+            data = response.json()
+
+        raise TimeoutError(f"Timed out after {timeout}s replacing the PDF context.")
+
     def _send_pdf_page_mapped(
         self,
         message: str,
@@ -472,73 +663,38 @@ class TokenlessLLM:
         if json_repair_attempts < 0:
             raise ValueError("json_repair_attempts must be zero or greater.")
 
-        pages = self._fetch_pdf_pages()
-        if not pages:
-            raise RuntimeError("PDF context is enabled, but the server returned no PDF pages.")
-
+        document_kwargs = dict(kwargs)
+        document_kwargs.setdefault("max_tokens", PDF_JSON_REPAIR_MAX_TOKENS)
+        pages = self._run_pdf_document_job(
+            message,
+            system_prompt=system_prompt,
+            page_progress=page_progress,
+            repair_malformed_json=repair_malformed_json,
+            json_repair_attempts=json_repair_attempts,
+            **document_kwargs,
+        )
         outputs: list[object] = []
-        page_job_kwargs = dict(kwargs)
-        page_job_kwargs.setdefault("max_tokens", PDF_JSON_REPAIR_MAX_TOKENS)
         total = len(pages)
         for index, page in enumerate(pages, start=1):
             page_number = int(page.get("page") or index)
-            page_markdown = str(page.get("markdown") or "")
-            if page_progress:
-                sys.stderr.write(
-                    f"Tokenless PDF page {index}/{total}: sending page {page_number}\n"
+            page_outputs = page.get("values") or []
+            if not isinstance(page_outputs, list):
+                raise RuntimeError(
+                    f"Unexpected JSON values for PDF page {page_number}: {page!r}"
                 )
-                sys.stderr.flush()
-            page_system_prompt = self._pdf_page_system_prompt(
-                page_number,
-                total,
-                page_markdown,
-                system_prompt=system_prompt,
-            )
-            content = self._run_pdf_page_job(
-                message,
-                system_prompt=page_system_prompt,
-                **page_job_kwargs,
-            ).strip()
-            page_outputs = self._extract_json_values(content)
-            repaired = False
-            if (
-                not page_outputs
-                and content
-                and repair_malformed_json
-                and json_repair_attempts
-            ):
-                if page_progress:
-                    sys.stderr.write(
-                        f"Tokenless PDF page {index}/{total}: repairing malformed JSON "
-                        f"from page {page_number}\n"
-                    )
-                    sys.stderr.flush()
-                page_outputs = self._repair_pdf_page_json(
-                    message,
-                    malformed_content=content,
-                    page_system_prompt=page_system_prompt,
-                    schema_hint=outputs[-1] if outputs else None,
-                    attempts=json_repair_attempts,
-                    **page_job_kwargs,
-                )
-                repaired = bool(page_outputs)
             outputs.extend(page_outputs)
             if page_progress:
-                if repaired:
-                    sys.stderr.write(
-                        f"Tokenless PDF page {index}/{total}: repaired JSON from "
-                        f"page {page_number}\n"
-                    )
-                elif page_outputs:
-                    sys.stderr.write(
-                        f"Tokenless PDF page {index}/{total}: extracted JSON from "
-                        f"page {page_number}\n"
-                    )
-                else:
-                    sys.stderr.write(
-                        f"Tokenless PDF page {index}/{total}: no JSON result for "
-                        f"page {page_number}\n"
-                    )
+                status = (
+                    "repaired JSON"
+                    if page.get("repaired")
+                    else "extracted JSON"
+                    if page_outputs
+                    else "no JSON result"
+                )
+                sys.stderr.write(
+                    f"Tokenless PDF page {index}/{total}: "
+                    f"{status} from page {page_number}\n"
+                )
                 sys.stderr.flush()
 
         return json.dumps(self._concatenate_json_values(outputs), ensure_ascii=False)
@@ -685,6 +841,95 @@ class TokenlessLLM:
                 merged_values.append(value)
         return merged_values
 
+    def _run_pdf_document_job(
+        self,
+        message: str,
+        *,
+        system_prompt: Optional[str] = None,
+        page_progress: bool,
+        repair_malformed_json: bool,
+        json_repair_attempts: int,
+        **kwargs,
+    ) -> list[dict]:
+        job_id = uuid.uuid4().hex
+        job_path = f"/tokenless/jobs/{job_id}"
+        stall_timeout = kwargs.pop("timeout", PDF_DOCUMENT_JOB_STALL_TIMEOUT)
+        if stall_timeout <= 0:
+            raise ValueError("PDF document job timeout must be greater than zero.")
+        deadline = time.time() + stall_timeout
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": message})
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            **kwargs,
+            "tokenless_pdf_map": {
+                "repair_malformed_json": repair_malformed_json,
+                "json_repair_attempts": json_repair_attempts,
+            },
+        }
+
+        self._retry_pdf_job_request(
+            "submit PDF document job",
+            deadline,
+            lambda: requests.post(
+                f"{self._base_url.rstrip('/')}{job_path}",
+                json=payload,
+                timeout=60,
+            ),
+        )
+        last_progress = None
+        while True:
+            response = self._retry_pdf_job_request(
+                "poll PDF document job",
+                deadline,
+                lambda: requests.get(
+                    f"{self._base_url.rstrip('/')}{job_path}",
+                    timeout=60,
+                ),
+            )
+            data = response.json()
+            status = data.get("status")
+            if status == "complete":
+                pages = data.get("pages")
+                if not isinstance(pages, list):
+                    raise RuntimeError(
+                        "Unexpected PDF document job response from "
+                        f"{self._base_url.rstrip('/')}{job_path}: {data!r}"
+                    )
+                return pages
+            if status == "error":
+                raise RuntimeError(f"PDF document job {job_id} failed: {data.get('error')}")
+            if status != "running":
+                raise RuntimeError(
+                    "Unexpected PDF document job response from "
+                    f"{self._base_url.rstrip('/')}{job_path}: {data!r}"
+                )
+
+            progress = (
+                data.get("current_page"),
+                data.get("total_pages"),
+                data.get("page_number"),
+            )
+            if progress != last_progress and progress[0]:
+                deadline = time.time() + stall_timeout
+            if page_progress and progress != last_progress and progress[0]:
+                sys.stderr.write(
+                    f"Tokenless PDF page {progress[0]}/{progress[1]}: "
+                    f"processing page {progress[2]}\n"
+                )
+                sys.stderr.flush()
+            last_progress = progress
+            time.sleep(PDF_PAGE_JOB_POLL_INTERVAL)
+
+            if time.time() >= deadline:
+                raise TimeoutError(
+                    f"PDF document job {job_id} made no page progress for "
+                    f"{stall_timeout}s."
+                )
+
     def _run_pdf_page_job(
         self,
         message: str,
@@ -693,7 +938,7 @@ class TokenlessLLM:
         **kwargs,
     ) -> str:
         job_id = uuid.uuid4().hex
-        job_url = f"{self._base_url.rstrip('/')}/tokenless/jobs/{job_id}"
+        job_path = f"/tokenless/jobs/{job_id}"
         timeout = kwargs.pop("timeout", PDF_PAGE_JOB_TIMEOUT)
         deadline = time.time() + timeout
         messages = []
@@ -705,13 +950,20 @@ class TokenlessLLM:
         self._retry_pdf_job_request(
             "submit",
             deadline,
-            lambda: requests.post(job_url, json=payload, timeout=60),
+            lambda: requests.post(
+                f"{self._base_url.rstrip('/')}{job_path}",
+                json=payload,
+                timeout=60,
+            ),
         )
         while time.time() < deadline:
             response = self._retry_pdf_job_request(
                 "poll",
                 deadline,
-                lambda: requests.get(job_url, timeout=60),
+                lambda: requests.get(
+                    f"{self._base_url.rstrip('/')}{job_path}",
+                    timeout=60,
+                ),
             )
             data = response.json()
             status = data.get("status")
@@ -720,13 +972,21 @@ class TokenlessLLM:
             if status == "error":
                 raise RuntimeError(f"PDF page job {job_id} failed: {data.get('error')}")
             if status != "running":
-                raise RuntimeError(f"Unexpected PDF page job response from {job_url}: {data!r}")
+                raise RuntimeError(
+                    "Unexpected PDF page job response from "
+                    f"{self._base_url.rstrip('/')}{job_path}: {data!r}"
+                )
             time.sleep(PDF_PAGE_JOB_POLL_INTERVAL)
         raise TimeoutError(f"Timed out after {timeout}s waiting for PDF page job {job_id}.")
 
-    @staticmethod
-    def _retry_pdf_job_request(action: str, deadline: float, request) -> requests.Response:
+    def _retry_pdf_job_request(
+        self,
+        action: str,
+        deadline: float,
+        request,
+    ) -> requests.Response:
         last_error = None
+        last_recovery_attempt = 0.0
         while time.time() < deadline:
             try:
                 response = request()
@@ -734,8 +994,50 @@ class TokenlessLLM:
                 return response
             except requests.RequestException as e:
                 last_error = e
+                now = time.time()
+                if now - last_recovery_attempt >= 15:
+                    last_recovery_attempt = now
+                    self._recover_public_endpoint()
                 time.sleep(PDF_PAGE_JOB_POLL_INTERVAL)
         raise TimeoutError(f"Timed out during PDF page job {action}. Last error: {last_error!r}")
+
+    def _recover_public_endpoint(self) -> bool:
+        current_url = (self._base_url or "").rstrip("/")
+        monitored_url = str(getattr(self._notebook, "public_url", "") or "").rstrip("/")
+        if monitored_url and monitored_url != current_url:
+            latest_url = monitored_url
+        else:
+            latest_url = None
+        latest_url_reader = getattr(self._notebook, "latest_public_url", None)
+        if latest_url is None and latest_url_reader is not None:
+            latest_url = latest_url_reader()
+        if not latest_url:
+            return False
+
+        hostname = urlparse(latest_url).hostname
+        if hostname:
+            try:
+                self._register_doh_override(hostname)
+            except requests.RequestException:
+                pass
+        if latest_url.rstrip("/") == current_url:
+            return False
+
+        try:
+            self._wait_for_endpoint_ready(latest_url, timeout=120)
+        except TimeoutError:
+            return False
+
+        self._base_url = latest_url.rstrip("/")
+        self._openai_client = openai.OpenAI(
+            base_url=f"{self._base_url}/v1",
+            api_key="kaggle-free",
+            timeout=3600,
+        )
+        logger.info("Recovered Tokenless public endpoint: %s", self._base_url)
+        sys.stderr.write(f"Tokenless recovered public endpoint: {self._base_url}\n")
+        sys.stderr.flush()
+        return True
 
     def _fetch_pdf_pages(self) -> list[dict]:
         self._assert_inference()

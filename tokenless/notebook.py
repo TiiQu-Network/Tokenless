@@ -505,6 +505,25 @@ class KaggleNotebookManager:
         self._temporary_dataset_owner = None
         self._temporary_dataset_slug = None
 
+    def latest_public_url(self) -> Optional[str]:
+        """Return the newest tunnel URL printed by the running Kaggle kernel."""
+        current_url = self.public_url.rstrip("/") if self.public_url else None
+        if not self.kernel_ref:
+            return current_url
+        try:
+            logs = self._configure_api().kernels_logs(self.kernel_ref) or ""
+        except Exception as e:  # noqa: BLE001 - recovery is best effort
+            logger.debug("Could not read Kaggle kernel logs during tunnel recovery: %r", e)
+            return current_url
+        if not isinstance(logs, str):
+            logs = json.dumps(logs)
+        matches = re.findall(
+            r"TOKENLESS_PUBLIC_URL topic=[^\s]+ "
+            r"url=(https://[-a-zA-Z0-9.]+\.trycloudflare\.com)",
+            logs,
+        )
+        return matches[-1].rstrip("/") if matches else current_url
+
     def _start_ollama_gpt_oss_20b_server(
         self,
         owner: str,
@@ -527,7 +546,7 @@ class KaggleNotebookManager:
         rendezvous_topic = f"tokenless-{uuid.uuid4().hex}"
         public_url_queue: queue.Queue[str] = queue.Queue(maxsize=1)
         listener = threading.Thread(
-            target=self._listen_for_public_url,
+            target=self._monitor_public_urls,
             args=(rendezvous_topic, public_url_queue, status_timeout, progress_callback),
             daemon=True,
         )
@@ -706,6 +725,52 @@ class KaggleNotebookManager:
                         if match:
                             public_url_queue.put(match.group(0).rstrip("/"))
                             return
+                        if progress_callback and message:
+                            progress_callback(message)
+            except requests.RequestException:
+                pass
+            time.sleep(min(1.0, max(0.0, deadline - time.time())))
+
+    def _monitor_public_urls(
+        self,
+        topic: str,
+        public_url_queue: "queue.Queue[str]",
+        timeout: int,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """Keep listening so replacement quick-tunnel URLs reach the client."""
+        pattern = re.compile(r"https://[-a-zA-Z0-9.]+\.trycloudflare\.com")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = max(1.0, deadline - time.time())
+            try:
+                with requests.get(
+                    f"https://ntfy.sh/{topic}/json",
+                    stream=True,
+                    timeout=(10, min(30.0, remaining)),
+                ) as response:
+                    response.raise_for_status()
+                    for line in response.iter_lines(decode_unicode=True):
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if event.get("event") != "message":
+                            continue
+                        message = str(event.get("message", ""))
+                        match = pattern.search(message)
+                        if match:
+                            url = match.group(0).rstrip("/")
+                            self.public_url = url
+                            if public_url_queue.empty():
+                                try:
+                                    public_url_queue.put_nowait(url)
+                                except queue.Full:
+                                    pass
+                            logger.info("Received Tokenless public URL update: %s", url)
+                            continue
                         if progress_callback and message:
                             progress_callback(message)
             except requests.RequestException:

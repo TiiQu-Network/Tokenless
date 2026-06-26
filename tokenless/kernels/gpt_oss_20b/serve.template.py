@@ -24,10 +24,18 @@ OUT = Path("/kaggle/working/tokenless_public_url.txt")
 ERR = Path("/kaggle/working/tokenless_server_error.txt")
 CLOUDFLARED_LOG = Path("/tmp/tokenless_cloudflared.log")
 PDF_MARKDOWN = Path("/kaggle/working/tokenless_pdf_context.md")
+UPLOADED_PDF = Path("/kaggle/working/tokenless_uploaded.pdf")
+OCR_PDF = Path("/kaggle/working/tokenless_input_ocr.pdf")
+MAX_PDF_UPLOAD_BYTES = 250 * 1024 * 1024
 PAGE_MAP_MIN_PROMPT_CHARS = 4000
 PAGE_MAP_REQUEST_TIMEOUT = 3600
 PAGE_JOBS = {}
 PAGE_JOBS_LOCK = threading.Lock()
+PDF_UPLOAD_JOBS = {}
+PDF_UPLOAD_JOBS_LOCK = threading.Lock()
+PDF_CONTEXT_LOCK = threading.Lock()
+PDF_TOOLS_LOCK = threading.Lock()
+PDF_TOOLS_READY = False
 
 
 def _fail(msg: str) -> None:
@@ -42,10 +50,7 @@ def _run(cmd: str, error: str) -> None:
 
 def _publish(message: str) -> None:
     if not NTFY_TOPIC or NTFY_TOPIC.startswith("__TOKENLESS_"):
-<<<<<<< HEAD
-=======
         print(f"NTFY_TOPIC is not set; skipping publish of message: {message}", flush=True)
->>>>>>> 7f54bf7 (JSON extractor)
         return
     try:
         req = urllib.request.Request(
@@ -55,11 +60,7 @@ def _publish(message: str) -> None:
         )
         urllib.request.urlopen(req, timeout=10).read()
     except (urllib.error.URLError, TimeoutError):
-<<<<<<< HEAD
-        pass
-=======
         print(f"Failed to publish message to NTFY: {message}", flush=True)
->>>>>>> 7f54bf7 (JSON extractor)
 
 
 def _decode_b64(value: str) -> str:
@@ -169,6 +170,22 @@ def _install_pdf_tools() -> None:
     )
 
 
+def _ensure_pdf_tools() -> None:
+    global PDF_TOOLS_READY
+    with PDF_TOOLS_LOCK:
+        if PDF_TOOLS_READY:
+            return
+        _install_pdf_tools()
+        PDF_TOOLS_READY = True
+
+
+def _clear_pdf_context() -> None:
+    for path in (PDF_MARKDOWN, UPLOADED_PDF, OCR_PDF):
+        path.unlink(missing_ok=True)
+    with PAGE_JOBS_LOCK:
+        PAGE_JOBS.clear()
+
+
 def _find_pdf_path(dataset_slug: str, filename: str) -> Path:
     input_root = Path("/kaggle/input")
     dataset_dirs = [input_root / dataset_slug]
@@ -205,17 +222,17 @@ def _pdf_to_markdown(pdf_path: Path) -> str:
     import ocrmypdf  # noqa: E402
     import pymupdf4llm  # noqa: E402
 
-    ocr_pdf = Path("/kaggle/working/tokenless_input_ocr.pdf")
+    OCR_PDF.unlink(missing_ok=True)
     print("Running OCR pass for image and mixed-content PDFs...", flush=True)
     try:
         ocrmypdf.ocr(
             str(pdf_path),
-            str(ocr_pdf),
+            str(OCR_PDF),
             skip_text=True,
             deskew=True,
             progress_bar=False,
         )
-        source = ocr_pdf
+        source = OCR_PDF
     except ocrmypdf.exceptions.PriorOcrFoundError:
         source = pdf_path
     except Exception as e:  # noqa: BLE001 - fall back for already-readable PDFs
@@ -234,12 +251,55 @@ def _pdf_to_markdown(pdf_path: Path) -> str:
     return markdown
 
 
+def _replace_pdf_context(upload_path: Path, filename: str) -> dict:
+    with PDF_CONTEXT_LOCK:
+        _clear_pdf_context()
+        try:
+            upload_path.replace(UPLOADED_PDF)
+            _ensure_pdf_tools()
+            markdown = _pdf_to_markdown(UPLOADED_PDF)
+        except BaseException as exc:
+            _clear_pdf_context()
+            raise RuntimeError(f"PDF conversion failed: {exc}") from exc
+
+        pages = _split_pdf_pages(markdown)
+        safe_filename = Path(filename).name or "upload.pdf"
+        print(
+            f"Replaced PDF context with {safe_filename} "
+            f"({len(markdown)} chars, {len(pages)} pages).",
+            flush=True,
+        )
+        return {
+            "filename": safe_filename,
+            "pages": len(pages),
+            "markdown_chars": len(markdown),
+        }
+
+
+def _run_pdf_upload_job(job_id: str, upload_path: Path, filename: str) -> None:
+    try:
+        result = _replace_pdf_context(upload_path, filename)
+    except BaseException as exc:
+        upload_path.unlink(missing_ok=True)
+        job = {"status": "error", "error": repr(exc)}
+    else:
+        job = {"status": "complete", **result}
+    with PDF_UPLOAD_JOBS_LOCK:
+        PDF_UPLOAD_JOBS[job_id] = job
+
+
+def _get_pdf_upload_job(job_id: str):
+    with PDF_UPLOAD_JOBS_LOCK:
+        job = PDF_UPLOAD_JOBS.get(job_id)
+        return dict(job) if job else None
+
+
 def _prepare_pdf_context() -> None:
     dataset_slug = _decode_b64(INPUT_DATASET_SLUG_B64)
     filename = _decode_b64(INPUT_FILENAME_B64)
     if not dataset_slug or not filename:
         return
-    _install_pdf_tools()
+    _ensure_pdf_tools()
     markdown = _pdf_to_markdown(_find_pdf_path(dataset_slug, filename))
     print(f"Stored PDF Markdown context ({len(markdown)} chars).", flush=True)
     _publish("PDF context ready")
@@ -260,13 +320,8 @@ def _inject_pdf_context(payload: dict) -> dict:
     selected_context = _select_pdf_context(markdown, question)
     context = (
         "You are answering questions about an uploaded PDF. Use the source-aware "
-<<<<<<< HEAD
-        "Markdown context below as the source of truth. Each block has page and "
-        "section source markers. If the answer is not in the PDF, say you cannot "
-=======
         "Markdown context below as the source of truth. Each block has page and section "
         "source markers. If the answer is not in the PDF, say you cannot "
->>>>>>> 7f54bf7 (JSON extractor)
         "find it in the document.\n\n"
         f"<pdf_markdown>\n{selected_context}\n</pdf_markdown>"
     )
@@ -337,7 +392,185 @@ def _assistant_content(response_payload: dict) -> str:
     return str(message.get("content") or "").strip()
 
 
+def _extract_json_values(content: str) -> list:
+    values = []
+    start = None
+    stack = []
+    in_string = False
+    escaped = False
+    matching = {"}": "{", "]": "["}
+    for index, char in enumerate(content):
+        if start is None:
+            if char in "{[":
+                start = index
+                stack = [char]
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]":
+            if not stack or stack[-1] != matching[char]:
+                start = None
+                stack = []
+                continue
+            stack.pop()
+            if not stack:
+                candidate = content[start : index + 1]
+                try:
+                    value = json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(value, (dict, list)):
+                        values.append(value)
+                start = None
+    return values
+
+
+def _json_shape_hint(value, depth: int = 0):
+    if depth >= 4:
+        return type(value).__name__
+    if isinstance(value, dict):
+        return {
+            key: _json_shape_hint(item, depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_json_shape_hint(value[0], depth + 1)] if value else []
+    if value is None:
+        return None
+    return type(value).__name__
+
+
+def _repair_page_json(
+    page_payload: dict,
+    *,
+    original_message: str,
+    malformed_content: str,
+    schema_hint,
+    attempts: int,
+) -> list:
+    messages = list(page_payload.get("messages") or [])
+    system_content = ""
+    if messages and messages[0].get("role") == "system":
+        system_content = str(messages[0].get("content") or "")
+    repair_system = (
+        f"{system_content}\n\n"
+        "<tokenless_json_repair_agent>\n"
+        "Re-read the PDF page context and regenerate the answer as one complete "
+        "valid JSON object or array. Preserve recoverable facts, match the earlier "
+        "valid response schema when applicable, and return no Markdown fences, "
+        "analysis, comments, or trailing text.\n"
+        "</tokenless_json_repair_agent>"
+    )
+    schema_text = (
+        json.dumps(_json_shape_hint(schema_hint), ensure_ascii=False)
+        if schema_hint is not None
+        else "No earlier valid page response is available."
+    )
+    candidate = malformed_content
+    for attempt in range(1, attempts + 1):
+        repair_message = (
+            "Original extraction request:\n"
+            f"{original_message}\n\n"
+            "Earlier valid page response to use only as a schema hint:\n"
+            f"{schema_text}\n\n"
+            f"Malformed response from repair attempt {attempt - 1}:\n"
+            f"{candidate}\n\n"
+            "Return the corrected, complete JSON now."
+        )
+        repair_payload = {
+            **page_payload,
+            "messages": [
+                {"role": "system", "content": repair_system},
+                {"role": "user", "content": repair_message},
+            ],
+            "temperature": 0,
+            "max_tokens": max(int(page_payload.get("max_tokens") or 0), 16_384),
+            "stream": False,
+        }
+        candidate = _assistant_content(_post_ollama_chat(repair_payload))
+        values = _extract_json_values(candidate)
+        if values:
+            return values
+    return []
+
+
+def _run_pdf_document_job(job_id: str, payload: dict) -> None:
+    options = dict(payload.pop("tokenless_pdf_map", {}) or {})
+    repair_malformed = bool(options.get("repair_malformed_json", True))
+    repair_attempts = max(0, int(options.get("json_repair_attempts", 2)))
+    original_message = _last_user_message(payload)
+    try:
+        markdown = PDF_MARKDOWN.read_text(encoding="utf-8")
+        pages = _split_pdf_pages(markdown)
+        page_results = []
+        schema_hint = None
+        for index, (page_number, page_markdown) in enumerate(pages, start=1):
+            with PAGE_JOBS_LOCK:
+                PAGE_JOBS[job_id] = {
+                    "status": "running",
+                    "current_page": index,
+                    "total_pages": len(pages),
+                    "page_number": page_number,
+                }
+            print(
+                f"Running document job on PDF page {page_number} "
+                f"({index}/{len(pages)})...",
+                flush=True,
+            )
+            page_payload = _payload_for_pdf_page(
+                payload,
+                page_number,
+                page_markdown,
+                len(pages),
+            )
+            content = _assistant_content(_post_ollama_chat(page_payload))
+            values = _extract_json_values(content)
+            repaired = False
+            if (
+                not values
+                and content
+                and repair_malformed
+                and repair_attempts
+            ):
+                values = _repair_page_json(
+                    page_payload,
+                    original_message=original_message,
+                    malformed_content=content,
+                    schema_hint=schema_hint,
+                    attempts=repair_attempts,
+                )
+                repaired = bool(values)
+            if values:
+                schema_hint = values[-1]
+            page_results.append(
+                {
+                    "page": page_number,
+                    "values": values,
+                    "repaired": repaired,
+                }
+            )
+        update = {"status": "complete", "pages": page_results}
+    except Exception as e:  # noqa: BLE001 - return remote inference failures to the client
+        update = {"status": "error", "error": repr(e)}
+    with PAGE_JOBS_LOCK:
+        PAGE_JOBS[job_id] = update
+
+
 def _run_page_job(job_id: str, payload: dict) -> None:
+    if payload.get("tokenless_pdf_map") is not None:
+        _run_pdf_document_job(job_id, payload)
+        return
     try:
         content = _assistant_content(_post_ollama_chat(payload))
         update = {"status": "complete", "content": content}
@@ -446,7 +679,68 @@ class TokenlessProxy(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _handle_pdf_upload(self, job_id: str) -> None:
+        existing_job = _get_pdf_upload_job(job_id)
+        if existing_job is not None:
+            status = 202 if existing_job.get("status") == "running" else 200
+            self._send_json(status, existing_job)
+            return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            self._send_json(411, {"error": "A non-empty PDF upload is required."})
+            return
+        if length > MAX_PDF_UPLOAD_BYTES:
+            self._send_json(
+                413,
+                {"error": f"PDF exceeds the {MAX_PDF_UPLOAD_BYTES}-byte upload limit."},
+            )
+            return
+
+        upload_temp = Path(f"/kaggle/working/tokenless_upload_{job_id}.part")
+        upload_temp.unlink(missing_ok=True)
+        remaining = length
+        with upload_temp.open("wb") as output:
+            while remaining:
+                chunk = self.rfile.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ConnectionError("PDF upload ended before Content-Length bytes arrived.")
+                output.write(chunk)
+                remaining -= len(chunk)
+
+        with upload_temp.open("rb") as uploaded:
+            if b"%PDF-" not in uploaded.read(1024):
+                upload_temp.unlink(missing_ok=True)
+                self._send_json(400, {"error": "Uploaded content is not a PDF file."})
+                return
+
+        encoded_filename = self.headers.get("X-Tokenless-Filename-B64", "")
+        try:
+            filename = base64.b64decode(encoded_filename).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            filename = "upload.pdf"
+        with PDF_UPLOAD_JOBS_LOCK:
+            PDF_UPLOAD_JOBS.clear()
+            PDF_UPLOAD_JOBS[job_id] = {"status": "running"}
+        threading.Thread(
+            target=_run_pdf_upload_job,
+            args=(job_id, upload_temp, filename),
+            daemon=True,
+        ).start()
+        self._send_json(202, {"status": "running"})
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
+        upload_match = re.fullmatch(
+            r"/tokenless/pdf/upload/([a-f0-9]+)",
+            self.path.rstrip("/"),
+        )
+        if upload_match:
+            job = _get_pdf_upload_job(upload_match.group(1))
+            if job is None:
+                self._send_json(404, {"error": "Unknown PDF upload job."})
+                return
+            self._send_json(200, job)
+            return
         job_match = re.fullmatch(r"/tokenless/jobs/([a-f0-9]+)", self.path.rstrip("/"))
         if job_match:
             job = _get_page_job(job_match.group(1))
@@ -460,8 +754,8 @@ class TokenlessProxy(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "PDF Markdown context is not available."})
                 return
             pages = [
-                {"page": page_number, "markdown": page_markdown}
-                for page_number, page_markdown in _split_pdf_pages(
+                {"page": page_number}
+                for page_number, _page_markdown in _split_pdf_pages(
                     PDF_MARKDOWN.read_text(encoding="utf-8")
                 )
             ]
@@ -484,6 +778,13 @@ class TokenlessProxy(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler name
         try:
+            upload_match = re.fullmatch(
+                r"/tokenless/pdf/upload/([a-f0-9]+)",
+                self.path.rstrip("/"),
+            )
+            if upload_match:
+                self._handle_pdf_upload(upload_match.group(1))
+                return
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length)
             payload = json.loads(body.decode("utf-8"))
@@ -521,6 +822,61 @@ def _start_proxy() -> None:
     server = ThreadingHTTPServer(("0.0.0.0", 8000), TokenlessProxy)
     print("Starting Tokenless PDF context proxy on port 8000...", flush=True)
     server.serve_forever()
+
+
+def _start_public_tunnel() -> tuple[subprocess.Popen, object, str, float]:
+    CLOUDFLARED_LOG.unlink(missing_ok=True)
+    log_file = CLOUDFLARED_LOG.open("wb")
+    process = subprocess.Popen(
+        [
+            "cloudflared",
+            "tunnel",
+            "--url",
+            "http://localhost:8000",
+            "--no-autoupdate",
+        ],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+
+    url = None
+    deadline = time.time() + 180
+    pattern = re.compile(r"https://[-a-zA-Z0-9.]+\.trycloudflare\.com")
+    while time.time() < deadline:
+        if process.poll() is not None:
+            break
+        if CLOUDFLARED_LOG.exists():
+            text = CLOUDFLARED_LOG.read_text(encoding="utf-8", errors="replace")
+            match = pattern.search(text)
+            if match:
+                url = match.group(0)
+                break
+        time.sleep(1)
+
+    if not url:
+        log_file.close()
+        tail = (
+            CLOUDFLARED_LOG.read_text(encoding="utf-8", errors="replace")[-4000:]
+            if CLOUDFLARED_LOG.exists()
+            else ""
+        )
+        _fail(f"Timed out waiting for cloudflared public URL. Log tail: {tail}")
+
+    OUT.write_text(url, encoding="utf-8")
+    _publish(url)
+    print("Published TOKENLESS_PUBLIC_URL to rendezvous channel.", flush=True)
+    print(f"TOKENLESS_PUBLIC_URL topic={NTFY_TOPIC} url={url}", flush=True)
+    return process, log_file, url, time.time()
+
+
+def _stop_public_tunnel(process, log_file) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+    log_file.close()
 
 
 print("Installing system dependencies...", flush=True)
@@ -563,40 +919,9 @@ _run(
 
 print("Starting public tunnel...", flush=True)
 _publish("Starting public tunnel")
-target_port = 8000 if PDF_MARKDOWN.exists() else 11434
-if PDF_MARKDOWN.exists():
-    threading.Thread(target=_start_proxy, daemon=True).start()
-    time.sleep(2)
-os.system(
-    f"nohup cloudflared tunnel --url http://localhost:{target_port} --no-autoupdate "
-    f"> {CLOUDFLARED_LOG} 2>&1 &"
-)
-
-url = None
-deadline = time.time() + 180
-pattern = re.compile(r"https://[-a-zA-Z0-9.]+\.trycloudflare\.com")
-while time.time() < deadline:
-    if CLOUDFLARED_LOG.exists():
-        text = CLOUDFLARED_LOG.read_text(encoding="utf-8", errors="replace")
-        match = pattern.search(text)
-        if match:
-            url = match.group(0)
-            break
-    time.sleep(1)
-
-if not url:
-    _fail("Timed out waiting for cloudflared public URL.")
-
-OUT.write_text(url, encoding="utf-8")
-<<<<<<< HEAD
-print(f"TOKENLESS_PUBLIC_URL topic={NTFY_TOPIC} url={url}", flush=True)
-_publish(url)
-print("Published TOKENLESS_PUBLIC_URL to rendezvous channel.", flush=True)
-=======
-_publish(url)
-print("Published TOKENLESS_PUBLIC_URL to rendezvous channel.", flush=True)
-print(f"TOKENLESS_PUBLIC_URL topic={NTFY_TOPIC} url={url}", flush=True)
->>>>>>> 7f54bf7 (JSON extractor)
+threading.Thread(target=_start_proxy, daemon=True).start()
+time.sleep(2)
+tunnel_process, tunnel_log, url, tunnel_started = _start_public_tunnel()
 
 print("Tokenless GPT-OSS server is ready. Keeping Kaggle kernel alive...", flush=True)
 
@@ -605,4 +930,18 @@ while True:
         urllib.request.urlopen("http://localhost:11434/api/version", timeout=5).read()
     except Exception as e:  # noqa: BLE001 - keep the kernel log useful
         print(f"Ollama health check failed: {e!r}", flush=True)
-    time.sleep(60)
+
+    restart_tunnel = tunnel_process.poll() is not None
+    if not restart_tunnel and time.time() - tunnel_started >= 90:
+        try:
+            urllib.request.urlopen(f"{url}/api/version", timeout=15).read()
+        except Exception as e:  # noqa: BLE001 - replace unhealthy quick tunnels
+            print(f"Public tunnel health check failed: {e!r}", flush=True)
+            restart_tunnel = True
+
+    if restart_tunnel:
+        print("Restarting public tunnel without stopping active jobs...", flush=True)
+        _stop_public_tunnel(tunnel_process, tunnel_log)
+        tunnel_process, tunnel_log, url, tunnel_started = _start_public_tunnel()
+
+    time.sleep(30)
